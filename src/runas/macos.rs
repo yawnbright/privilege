@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::ptr;
 
-use libc::{fcntl, fileno, waitpid, EINTR, F_GETOWN};
+use libc::{fcntl, fileno, kill, EINTR, F_GETOWN, SIGKILL};
 use security_framework_sys::authorization::{
     errAuthorizationSuccess, kAuthorizationFlagDefaults, kAuthorizationFlagDestroyRights,
     AuthorizationCreate, AuthorizationExecuteWithPrivileges, AuthorizationFree, AuthorizationRef,
@@ -15,13 +15,15 @@ use security_framework_sys::authorization::{
 
 use crate::runas::Command;
 
+pub(crate) const ENV_PATH: &str = "PATH";
+
 fn get_exe_path<P: AsRef<Path>>(exe_name: P) -> Option<PathBuf> {
     let exe_name = exe_name.as_ref();
     if exe_name.has_root() {
         return Some(exe_name.into());
     }
 
-    env::var_os(crate::runas::ENV_PATH).and_then(|paths| {
+    env::var_os(ENV_PATH).and_then(|paths| {
         env::split_paths(&paths)
             .filter_map(|dir| {
                 let full_path = dir.join(exe_name);
@@ -46,7 +48,51 @@ macro_rules! make_cstring {
     };
 }
 
-unsafe fn gui_runas(prog: *const i8, argv: *const *const i8) -> i32 {
+pub struct ChildInner {
+    pid: i32,
+    auth_ref: AuthorizationRef,
+}
+
+impl ChildInner {
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        let mut status = 0;
+        loop {
+            let r = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            if r == -1 && io::Error::last_os_error().raw_os_error() == Some(EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        unsafe {
+            AuthorizationFree(self.auth_ref, kAuthorizationFlagDestroyRights);
+        }
+        Ok(unsafe { mem::transmute::<i32, ExitStatus>(status) })
+    }
+
+    pub fn kill(&mut self) -> io::Result<()> {
+        let result = unsafe { kill(self.pid, SIGKILL) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.pid as u32
+    }
+}
+
+impl Drop for ChildInner {
+    fn drop(&mut self) {
+        unsafe {
+            AuthorizationFree(self.auth_ref, kAuthorizationFlagDestroyRights);
+        }
+    }
+}
+
+unsafe fn gui_spawn(prog: *const i8, argv: *const *const i8) -> io::Result<ChildInner> {
     let mut authref: AuthorizationRef = ptr::null_mut();
     let mut pipe: *mut libc::FILE = ptr::null_mut();
 
@@ -57,7 +103,10 @@ unsafe fn gui_runas(prog: *const i8, argv: *const *const i8) -> i32 {
         &mut authref,
     ) != errAuthorizationSuccess
     {
-        return -1;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "AuthorizationCreate failed",
+        ));
     }
     if AuthorizationExecuteWithPrivileges(
         authref,
@@ -68,30 +117,33 @@ unsafe fn gui_runas(prog: *const i8, argv: *const *const i8) -> i32 {
     ) != errAuthorizationSuccess
     {
         AuthorizationFree(authref, kAuthorizationFlagDestroyRights);
-        return -1;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "AuthorizationExecuteWithPrivileges failed",
+        ));
     }
 
     let pid = fcntl(fileno(pipe), F_GETOWN, 0);
-    let mut status = 0;
-    loop {
-        let r = waitpid(pid, &mut status, 0);
-        if r == -1 && io::Error::last_os_error().raw_os_error() == Some(EINTR) {
-            continue;
-        } else {
-            break;
-        }
+    if pid == -1 {
+        AuthorizationFree(authref, kAuthorizationFlagDestroyRights);
+        return Err(io::Error::last_os_error());
     }
 
-    AuthorizationFree(authref, kAuthorizationFlagDestroyRights);
-    status
+    Ok(ChildInner {
+        pid,
+        auth_ref: authref,
+    })
 }
 
-fn runas_root_gui(cmd: &Command) -> io::Result<ExitStatus> {
+pub fn runas_spawn(cmd: &Command) -> io::Result<crate::runas::Child> {
     let exe: OsString = match get_exe_path(&cmd.command) {
         Some(exe) => exe.into(),
-        None => unsafe {
-            return Ok(mem::transmute(!0));
-        },
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Command `{}` not found", cmd.command.to_string_lossy()),
+            ));
+        }
     };
     let prog = make_cstring!(exe);
     let mut args = vec![];
@@ -101,13 +153,5 @@ fn runas_root_gui(cmd: &Command) -> io::Result<ExitStatus> {
     let mut argv: Vec<_> = args.iter().map(|x| x.as_ptr()).collect();
     argv.push(ptr::null());
 
-    unsafe { Ok(mem::transmute(gui_runas(prog.as_ptr(), argv.as_ptr()))) }
-}
-
-pub fn runas_root(cmd: &Command) -> io::Result<ExitStatus> {
-    if cmd.gui {
-        runas_root_gui(cmd)
-    } else {
-        crate::runas::runas_root_sudo(cmd)
-    }
+    unsafe { gui_spawn(prog.as_ptr(), argv.as_ptr()).map(crate::runas::Child::new) }
 }

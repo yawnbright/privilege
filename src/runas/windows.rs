@@ -6,28 +6,72 @@ use std::os::windows::ffi::OsStrExt;
 use std::process::ExitStatus;
 use std::ptr;
 
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Com::{
     CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
-use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
-use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
-use windows_sys::Win32::UI::Shell::SEE_MASK_NOASYNC;
-use windows_sys::Win32::UI::Shell::SEE_MASK_NOCLOSEPROCESS;
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+};
+use windows_sys::Win32::UI::Shell::{
+    ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_NORMAL};
 
 use crate::runas::Command;
 
-unsafe fn win_runas(cmd: *const c_ushort, args: *const c_ushort, show: bool) -> u32 {
-    let mut code = 0;
+pub struct ChildInner {
+    handle: HANDLE,
+}
+
+impl ChildInner {
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        unsafe {
+            WaitForSingleObject(self.handle, 0xFFFFFFFF);
+            let mut code: u32 = 0;
+            if GetExitCodeProcess(self.handle, &mut code) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(mem::transmute(code))
+        }
+    }
+
+    pub fn kill(&mut self) -> io::Result<()> {
+        unsafe {
+            if TerminateProcess(self.handle, 1) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        0
+    }
+}
+
+impl Drop for ChildInner {
+    fn drop(&mut self) {
+        unsafe {
+            if self.handle != INVALID_HANDLE_VALUE && self.handle != 0 {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+unsafe fn win_spawn(
+    cmd: *const c_ushort,
+    args: *const c_ushort,
+    show: bool,
+) -> io::Result<ChildInner> {
     let mut sei: SHELLEXECUTEINFOW = mem::zeroed();
     let verb = "runas\0".encode_utf16().collect::<Vec<u16>>();
     CoInitializeEx(
         ptr::null(),
         COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
     );
-    
+
     sei.cbSize = mem::size_of::<SHELLEXECUTEINFOW>() as _;
     sei.lpVerb = verb.as_ptr();
     sei.lpFile = cmd;
@@ -35,20 +79,23 @@ unsafe fn win_runas(cmd: *const c_ushort, args: *const c_ushort, show: bool) -> 
     sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS;
     sei.nShow = if show { SW_NORMAL } else { SW_HIDE } as _;
 
-    if ShellExecuteExW(&mut sei) == 0 || sei.hProcess == 0 {
-        return !0;
+    if ShellExecuteExW(&mut sei) == 0 {
+        return Err(io::Error::last_os_error());
     }
 
-    WaitForSingleObject(sei.hProcess, INFINITE);
-
-    if GetExitCodeProcess(sei.hProcess, &mut code) == 0 {
-        !0
-    } else {
-        code
+    if sei.hProcess == 0 || sei.hProcess == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "No process handle returned",
+        ));
     }
+
+    Ok(ChildInner {
+        handle: sei.hProcess,
+    })
 }
 
-pub(crate) fn runas_root(cmd: &Command) -> io::Result<ExitStatus> {
+pub fn runas_spawn(cmd: &Command) -> io::Result<crate::runas::Child> {
     let mut params = String::new();
     for arg in cmd.args.iter() {
         let arg = arg.to_string_lossy();
@@ -79,11 +126,5 @@ pub(crate) fn runas_root(cmd: &Command) -> io::Result<ExitStatus> {
         .chain(Some(0))
         .collect::<Vec<_>>();
 
-    unsafe {
-        Ok(mem::transmute(win_runas(
-            file.as_ptr(),
-            params.as_ptr(),
-            !cmd.hide,
-        )))
-    }
+    unsafe { win_spawn(file.as_ptr(), params.as_ptr(), !cmd.hide).map(crate::runas::Child::new) }
 }
