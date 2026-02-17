@@ -25,7 +25,7 @@ pub struct ChildInner {
 }
 
 impl ChildInner {
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub fn wait(&self) -> io::Result<ExitStatus> {
         unsafe {
             WaitForSingleObject(self.handle, 0xFFFFFFFF);
             let mut code: u32 = 0;
@@ -36,7 +36,7 @@ impl ChildInner {
         }
     }
 
-    pub fn kill(&mut self) -> io::Result<()> {
+    pub fn kill(&self) -> io::Result<()> {
         unsafe {
             if TerminateProcess(self.handle, 1) == 0 {
                 return Err(io::Error::last_os_error());
@@ -84,10 +84,7 @@ unsafe fn win_spawn(
     }
 
     if sei.hProcess == 0 || sei.hProcess == INVALID_HANDLE_VALUE {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "No process handle returned",
-        ));
+        return Err(std::io::Error::other("No process handle returned"));
     }
 
     Ok(ChildInner {
@@ -100,7 +97,7 @@ pub fn runas_spawn(cmd: &Command) -> io::Result<crate::runas::Child> {
     for arg in cmd.args.iter() {
         let arg = arg.to_string_lossy();
         params.push(' ');
-        if arg.len() == 0 {
+        if arg.is_empty() {
             params.push_str("\"\"");
         } else if arg.find(&[' ', '\t', '"'][..]).is_none() {
             params.push_str(&arg);

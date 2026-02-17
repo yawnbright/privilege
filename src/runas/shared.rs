@@ -13,11 +13,11 @@ impl Child {
         Child { inner }
     }
 
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub fn wait(&self) -> io::Result<ExitStatus> {
         self.inner.wait()
     }
 
-    pub fn kill(&mut self) -> io::Result<()> {
+    pub fn kill(&self) -> io::Result<()> {
         self.inner.kill()
     }
 

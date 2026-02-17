@@ -54,7 +54,7 @@ pub struct ChildInner {
 }
 
 impl ChildInner {
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub fn wait(&self) -> io::Result<ExitStatus> {
         let mut status = 0;
         loop {
             let r = unsafe { libc::waitpid(self.pid, &mut status, 0) };
@@ -70,7 +70,7 @@ impl ChildInner {
         Ok(unsafe { mem::transmute::<i32, ExitStatus>(status) })
     }
 
-    pub fn kill(&mut self) -> io::Result<()> {
+    pub fn kill(&self) -> io::Result<()> {
         let result = unsafe { kill(self.pid, SIGKILL) };
         if result == -1 {
             Err(io::Error::last_os_error())
